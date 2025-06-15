@@ -290,6 +290,7 @@ namespace EREZ {
         mutable std::mutex _lock;
         std::unordered_map<FormID, actorbaseData> originalActorBaseLevels;
         std::unordered_map<FormID, dynamicData> dynamicActorBaseLevels;
+        std::set<FormID> modifiedActors;
 
         void SetActorBaseData(TESNPC* base, uint16_t originalMin, uint16_t originalMax, uint16_t min, uint16_t max) {
             auto baseFormID = base->GetFormID();
@@ -493,7 +494,7 @@ namespace EREZ {
             return true;
         }
 
-        void ResetActorbase(TESNPC* base) {
+        void ResetActorbase(TESNPC* base, Actor* actor, const char* eventName) {
             auto baseFormID = base->GetFormID();
             if (originalActorBaseLevels.find(baseFormID) != originalActorBaseLevels.end()) {
                 auto& tmp = originalActorBaseLevels.at(baseFormID);
@@ -503,6 +504,11 @@ namespace EREZ {
                                   tmp.originalMin, tmp.originalMax);
                     base->actorData.calcLevelMin = tmp.originalMin;
                     base->actorData.calcLevelMax = tmp.originalMax;
+
+                    if (modifiedActors.find(actor->GetHandle().native_handle()) != modifiedActors.end()) {
+                        RecalculateStatsTask(actor, eventName);
+                        logger::trace("  Recalculating stats as the actor has been previously modified.");
+                    }
                 }
             }
         }
@@ -529,15 +535,30 @@ namespace EREZ {
                 return (first.first - second.first) < 0;
             });
 
+            logger::trace("    attribute weights: {},{},{}", healthWeight, magickaWeight, staminaWeight);
+
             auto totalAttributePoints = attributesPerLevelUp * (level - 1);
             for (auto& pair : attributeIndices) {
                 auto index = pair.first;
                 auto weight = pair.second;
+                if (weight == 0) {
+                    continue;
+                }
                 auto add = static_cast<std::int64_t>((1.0 * weight) / totalWeight * totalAttributePoints);
+
+                logger::trace("    {}th attribute value from class: {}", index, add);
                 attributeValues[index] = add;
                 totalAttributePoints -= add;
                 totalWeight -= weight;
             }
+
+            logger::trace("    attributes from race: {},{},{}", actor->GetRace()->data.startingHealth,
+                          actor->GetRace()->data.startingMagicka, actor->GetRace()->data.startingStamina);
+
+            logger::trace("    attributes from npc: {},{},{}", base->actorData.healthOffset,
+                          base->actorData.magickaOffset, base->actorData.staminaOffset);
+
+            logger::trace("    health from level: {}", (level - 1) * healthLevelBonus);
 
             attributeValues[0] +=
                 base->actorData.healthOffset + actor->GetRace()->data.startingHealth + (level - 1) * healthLevelBonus;
@@ -548,13 +569,16 @@ namespace EREZ {
             attributeValues[1] = std::max(attributeValues[1], 0ll);
             attributeValues[2] = std::max(attributeValues[2], 0ll);
 
+            logger::trace("    calculated attributes: {}, {}, {}", attributeValues[0], attributeValues[1],
+                          attributeValues[2]);
+
             return attributeValues;
         }
 
-        void RecalculateStats(Actor* actor, TESNPC* base, const std::array<std::int64_t, 3>& attributes) {
+        void ApplyAttributesAndSkills(Actor* actor, TESNPC* base, const std::array<std::int64_t, 3>& attributes) {
             auto level = actor->GetLevel();
 
-            logger::trace("computing attributes ...");
+            logger::trace("    applying attributes ...");
 
             auto avOwner = actor->AsActorValueOwner();
 
@@ -568,7 +592,7 @@ namespace EREZ {
                 avOwner->SetBaseActorValue(ActorValue::kStamina, attributes[2]);
             }
 
-            logger::trace("computing skills ...");
+            logger::trace("    computing skills ...");
 
             std::uint8_t* skillWeights = reinterpret_cast<std::uint8_t*>(&base->npcClass->data.skillWeights);
             std::uint32_t totalSkillWeights = 0;
@@ -576,7 +600,7 @@ namespace EREZ {
                 totalSkillWeights += skillWeights[i];
             }
 
-            logger::trace("reading race bonus ...");
+            logger::trace("    reading race bonus ...");
 
             std::vector<std::uint8_t> currentSkill(18, skillsBase);
             for (std::size_t i = 0; i < actor->GetRace()->data.kNumSkillBoosts; ++i) {
@@ -595,7 +619,7 @@ namespace EREZ {
                 }
             }
 
-            logger::trace("computing initial skill distribution...");
+            logger::trace("    computing initial skill distribution...");
 
             auto totalSkillPoints = skillsPerLevelUp * (level - 1);
             auto remainingSkillPoints = totalSkillPoints;
@@ -627,7 +651,7 @@ namespace EREZ {
                 }
             }
 
-            logger::trace("computing excess skill distribution...");
+            logger::trace("    computing excess skill distribution...");
 
             while (remainingSkillPoints > 0) {
                 sortedSkills.sort(
@@ -659,6 +683,9 @@ namespace EREZ {
                     break;
                 }
             }
+
+            logger::trace("    applying skills...");
+
             for (std::size_t i = 0; i < 18; ++i) {
                 avOwner->SetBaseActorValue(static_cast<ActorValue>(i + 6), currentSkill[i]);
             }
@@ -747,6 +774,72 @@ namespace EREZ {
                 base->actorData.calcLevelMax, factor);
         }
 
+        void RecalculateStatsTask(Actor* actor, const char* eventName) {
+            auto refID = actor->GetHandle().native_handle();
+
+            SKSE::GetTaskInterface()->AddTask([refID, eventName]() {
+                auto actor = Actor::LookupByHandle(refID).get();
+                auto settings = Settings::GetSingleton();
+                if (!actor) {
+                    return;
+                }
+                auto base = actor->GetActorBase();
+                if (!base) {
+                    return;
+                }
+                auto npcClass = base->npcClass;
+                if (!npcClass) {
+                    return;
+                }
+                logger::trace("Recalculating reference [{:X}]({}).   {}", actor->GetFormID(), actor->GetName(),
+                              eventName);
+
+                auto attributes = UnlevelManager::GetSingleton()->RecalculateAttributes(actor, base, npcClass);
+
+                if (settings->smartStatsCalculate) {
+                    auto avOwner = actor->AsActorValueOwner();
+                    auto correctHealth = avOwner->GetBaseActorValue(ActorValue::kHealth) == attributes[0];
+                    if (correctHealth) {
+                        logger::trace("    Stat recalculation not necessary, because health is already correct.");
+                        return;
+                    }
+                }
+
+                switch (settings->calculateStats) {
+                    case 0: {
+                        logger::trace("    Stats recalculation is disabled.");
+                        break;
+                    }
+                    case 1: {
+                        logger::trace("    Recalculating stats ...");
+                        UnlevelManager::GetSingleton()->ApplyAttributesAndSkills(actor, base, attributes);
+                        break;
+                    }
+                    case 2: {
+                        logger::trace("    Using setlevel to trigger stat recalculation.");
+                        auto factory = IFormFactory::GetConcreteFormFactoryByType<Script>();
+                        if (factory) {
+                            auto consoleScript = factory->Create();
+                            if (consoleScript) {
+                                // the setlevel command forces recalculation of attributes (health, magicka,
+                                // stamina)
+                                auto commandStr = "setlevel " + std::to_string(base->actorData.level) + " 0 " +
+                                                  std::to_string(base->actorData.calcLevelMin) + " " +
+                                                  std::to_string(base->actorData.calcLevelMax) + "";
+                                consoleScript->SetCommand(commandStr);
+                                consoleScript->CompileAndRun(actor);
+                                delete consoleScript;
+                            }
+                        }
+                        break;
+                    }
+                    default: {
+                        break;
+                    }
+                }
+            });
+        }
+
     public:
         void ProcessActor(Actor* actor, const char* eventName) {
             if (!actor) {
@@ -763,7 +856,7 @@ namespace EREZ {
 
             if (!Filter(actor, base) || settings->manualUninstall) {
                 // The actor might have been releveled earlier, because it changed follower state
-                ResetActorbase(base);
+                ResetActorbase(base, actor, eventName);
                 return;
             }
 
@@ -807,7 +900,7 @@ namespace EREZ {
 
             if (!EZ) {
                 if (settings->noZoneSkip) {
-                    ResetActorbase(base);
+                    ResetActorbase(base, actor, eventName);
                     logger::trace("    No encounter zone found, skipping NPC.");
                     return;
                 } else {
@@ -844,71 +937,10 @@ namespace EREZ {
             }
 
             std::lock_guard<std::mutex> guard(_lock);
+            modifiedActors.insert(actor->GetHandle().native_handle());
             RelevelActorbase(base, minEZ, maxEZ);
 
-            auto refID = actor->GetHandle().native_handle();
-
-            SKSE::GetTaskInterface()->AddTask([refID, eventName]() {
-                auto actor = Actor::LookupByHandle(refID).get();
-                auto settings = Settings::GetSingleton();
-                if (!actor) {
-                    return;
-                }
-                auto base = actor->GetActorBase();
-                if (!base) {
-                    return;
-                }
-                auto npcClass = base->npcClass;
-                if (!npcClass) {
-                    return;
-                }
-                logger::trace("Recalculating reference [{:X}]({}).   {}", actor->GetFormID(), actor->GetName(),
-                              eventName);
-
-                auto attributes = UnlevelManager::GetSingleton()->RecalculateAttributes(actor, base, npcClass);
-
-                if (settings->smartStatsCalculate) {
-                    auto avOwner = actor->AsActorValueOwner();
-                    auto correctHealth = avOwner->GetBaseActorValue(ActorValue::kHealth) == attributes[0];
-                    if (correctHealth) {
-                        logger::trace("Stat recalculation not necessary, because health is already correct.");
-                        return;
-                    }
-                }
-
-                switch (settings->calculateStats) {
-                    case 0: {
-                        logger::trace("Stats recalculation is disabled.");
-                        break;
-                    }
-                    case 1: {
-                        logger::trace("Recalculating stats ...");
-                        UnlevelManager::GetSingleton()->RecalculateStats(actor, base, attributes);
-                        break;
-                    }
-                    case 2: {
-                        logger::trace("Using setlevel to trigger stat recalculation.");
-                        auto factory = IFormFactory::GetConcreteFormFactoryByType<Script>();
-                        if (factory) {
-                            auto consoleScript = factory->Create();
-                            if (consoleScript) {
-                                // the setlevel command forces recalculation of attributes (health, magicka,
-                                // stamina)
-                                auto commandStr = "setlevel " + std::to_string(base->actorData.level) + " 0 " +
-                                                  std::to_string(base->actorData.calcLevelMin) + " " +
-                                                  std::to_string(base->actorData.calcLevelMax) + "";
-                                consoleScript->SetCommand(commandStr);
-                                consoleScript->CompileAndRun(actor);
-                                delete consoleScript;
-                            }
-                        }
-                        break;
-                    }
-                    default: {
-                        break;
-                    }
-                }
-            });
+            RecalculateStatsTask(actor, eventName);
         }
 
     private:

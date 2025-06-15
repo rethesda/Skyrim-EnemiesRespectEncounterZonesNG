@@ -6,7 +6,7 @@ message("Using toolchain file ${CMAKE_TOOLCHAIN_FILE}.")
 ########################################################################################################################
 project(
         EnemiesRespectEncounterZones
-        VERSION 1.4.2
+        VERSION 1.4.3
         DESCRIPTION "EnemiesRespectEncounterZones"
         LANGUAGES CXX)
 set(CMAKE_CXX_STANDARD 23)
